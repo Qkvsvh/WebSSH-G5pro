@@ -1,0 +1,56 @@
+#!/bin/sh /etc/rc.common
+# conntrack-tune: 扩容 conntrack 表 + 缩短 UDP 超时，适配 PCDN 等高并发 UDP 场景
+#
+# 背景：G5 Pro 默认 nf_conntrack_max=16384 太小，PCDN 海量 UDP 短连接会把表顶满，
+#       内核丢包 -> 云端心跳(:30443)被丢 -> 中兴智慧生活 app 显示"广域网不在线"。
+#       本脚本开机自动应用；start 也立即生效，无需重启设备。
+#
+# 部署（在 G5 Pro 上，192.168.0.1:3540，root）：
+#   scp conntrack-tune root@192.168.0.1:/etc/init.d/conntrack-tune
+#   chmod +x /etc/init.d/conntrack-tune
+#   /etc/init.d/conntrack-tune enable        # 生成 /etc/rc.d/S99conntrack-tune，开机自启
+#   /etc/init.d/conntrack-tune start         # 立即生效
+#
+# 验证：
+#   cat /proc/sys/net/netfilter/nf_conntrack_max      # 应为 524288
+#   cat /proc/sys/net/netfilter/nf_conntrack_count    # 当前条目数（对比 max 看占用率）
+#
+# 注意：
+#   - 本机 /etc/rc.common 为 procd 模式，开机实际调用 start_service()；同时保留 start()
+#     作为手动 `xxx start` 的兜底（procd 不会调用 start()，但 rc.common 手动执行会）。
+#   - rc.local 在 G5 Pro 开机不执行，故用 procd init.d，不要依赖 rc.local。
+#   - 恢复出厂会清掉本脚本与 /etc/rc.d/S99conntrack-tune，需按上面步骤重新部署。
+#
+# 历史：本脚本曾用名 zz-conntrack（zz- 只是 OpenWrt 启动顺序占位符，
+#       名字不够直观）。改名 conntrack-tune 后语义清晰。旧名残留会自动清理。
+
+START=99
+STOP=10
+
+# ===== 可调参数（按需改这一块即可）=====
+CONNTRACK_MAX=524288        # 表上限；PCDN 场景 512k 足够，内存充裕也可改 1048576(1M)
+UDP_TIMEOUT=10              # UDP 短包超时(秒)，默认60->10，加速回收
+UDP_TIMEOUT_STREAM=30       # UDP 已建流超时(秒)，默认180->30
+TCP_EST_TIMEOUT=3600        # TCP 已建连接超时(秒)，默认432000->3600
+
+apply_settings() {
+    [ -w /proc/sys/net/netfilter/nf_conntrack_max ] && \
+        echo "$CONNTRACK_MAX" > /proc/sys/net/netfilter/nf_conntrack_max
+    [ -w /proc/sys/net/netfilter/nf_conntrack_udp_timeout ] && \
+        echo "$UDP_TIMEOUT" > /proc/sys/net/netfilter/nf_conntrack_udp_timeout
+    [ -w /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream ] && \
+        echo "$UDP_TIMEOUT_STREAM" > /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream
+    [ -w /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established ] && \
+        echo "$TCP_EST_TIMEOUT" > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established
+    logger -t conntrack-tune "applied: max=$CONNTRACK_MAX udp=$UDP_TIMEOUT udp_stream=$UDP_TIMEOUT_STREAM tcp_est=$TCP_EST_TIMEOUT"
+}
+
+# procd 模式开机调用此入口
+start_service() {
+    apply_settings
+}
+
+# 手动直接调用脚本 start 时的兜底
+start() {
+    apply_settings
+}

@@ -1,0 +1,1274 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"gossh/app/config"
+	"gossh/app/middleware"
+	"gossh/app/model"
+	"gossh/app/service"
+	"gossh/gin"
+	"io"
+	"io/fs"
+	"log/slog"
+	"mime"
+	"net/http"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+var version = "dev"
+
+const GithubRepo = "Qkvsvh/WebSSH-G5pro"
+
+type GithubAsset struct {
+	Name               string `json:"name"`
+	Size               int64  `json:"size"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+type GithubRelease struct {
+	TagName string        `json:"tag_name"`
+	HTMLURL string        `json:"html_url"`
+	Name    string        `json:"name"`
+	Body    string        `json:"body"`
+	Assets  []GithubAsset `json:"assets"`
+}
+
+type UpdateVersionInfo struct {
+	CurrentVersion string `json:"current_version"`
+	LatestVersion  string `json:"latest_version"`
+	HasUpdate      bool   `json:"has_update"`
+	ReleaseURL     string `json:"release_url"`
+	ReleaseName    string `json:"release_name"`
+	ReleaseBody    string `json:"release_body"`
+	AssetName      string `json:"asset_name"`
+	AssetSize      int64  `json:"asset_size"`
+}
+
+// 使用go 1.16+ 新特性
+//
+//go:embed webroot
+var dir embed.FS
+
+// StaticFile 嵌入普通的静态资源
+type StaticFile struct {
+	// 静态资源
+	embedFS embed.FS
+
+	// 设置embed文件到静态资源的相对路径，也就是embed注释里的路径
+	path string
+}
+
+// Open 静态资源被访问的核心逻辑
+func (w StaticFile) Open(name string) (fs.File, error) {
+	if filepath.Separator != '/' && strings.ContainsRune(name, filepath.Separator) {
+		return nil, errors.New("http: invalid character in file path")
+	}
+
+	fullName := filepath.Join(w.path, filepath.FromSlash(path.Clean("/"+name)))
+	fullName = strings.ReplaceAll(fullName, `\`, `/`)
+	file, err := w.embedFS.Open(fullName)
+	return file, err
+}
+
+func getLatestGithubRelease() (*GithubRelease, error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", GithubRepo)
+
+	client := &http.Client{
+		Timeout: 12 * time.Second,
+	}
+
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "WebSSH-G5pro-Updater")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github api 返回异常: %s", resp.Status)
+	}
+
+	var release GithubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return nil, err
+	}
+
+	if strings.TrimSpace(release.TagName) == "" {
+		return nil, fmt.Errorf("github release tag 为空")
+	}
+
+	return &release, nil
+}
+func selectUpdateAsset(release *GithubRelease) (*GithubAsset, error) {
+	if release == nil {
+		return nil, fmt.Errorf("release 为空")
+	}
+
+	for _, asset := range release.Assets {
+		name := strings.ToLower(asset.Name)
+
+		if strings.HasPrefix(name, "webssh_") {
+			return &asset, nil
+		}
+	}
+
+	for _, asset := range release.Assets {
+		name := strings.ToLower(asset.Name)
+
+		if strings.Contains(name, "webssh") &&
+			!strings.HasSuffix(name, ".txt") &&
+			!strings.HasSuffix(name, ".sha256") &&
+			!strings.HasSuffix(name, ".json") {
+			return &asset, nil
+		}
+	}
+
+	return nil, fmt.Errorf("没有找到可用的 webssh 二进制资产")
+}
+
+const VersionJSONURL = "https://github.com/Qkvsvh/WebSSH-G5pro/releases/latest/download/version.json"
+
+type VersionJSONInfo struct {
+	Version string `json:"version"`
+	SHA256  string `json:"sha256"`
+}
+
+func fetchExpectedSHA256(proxy string) (string, error) {
+	targetURL := VersionJSONURL
+	if proxy != "" {
+		trimmed := strings.TrimPrefix(VersionJSONURL, "https://")
+		p := proxy
+		if !strings.HasSuffix(p, "/") {
+			p += "/"
+		}
+		targetURL = p + trimmed
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "WebSSH-G5pro-Updater")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var info VersionJSONInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return "", fmt.Errorf("解析 version.json 失败: %v", err)
+	}
+
+	if info.SHA256 == "" {
+		return "", fmt.Errorf("version.json 中 sha256 为空")
+	}
+
+	return strings.ToLower(info.SHA256), nil
+}
+
+func computeFileSHA256(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func verifyFileSHA256(filePath string, proxy string) error {
+	expected, err := fetchExpectedSHA256(proxy)
+	if err != nil {
+		return fmt.Errorf("获取校验值失败: %v", err)
+	}
+
+	actual, err := computeFileSHA256(filePath)
+	if err != nil {
+		return fmt.Errorf("计算文件 SHA256 失败: %v", err)
+	}
+
+	if expected != actual {
+		return fmt.Errorf("SHA256 校验失败: 期望 %s, 实际 %s", expected, actual)
+	}
+
+	return nil
+}
+
+func UpdateVersionHandler(c *gin.Context) {
+	release, err := getLatestGithubRelease()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "获取 GitHub 最新版本失败: " + err.Error(),
+		})
+		return
+	}
+
+	currentVersion := strings.TrimSpace(version)
+	latestVersion := strings.TrimSpace(release.TagName)
+
+	asset, assetErr := selectUpdateAsset(release)
+
+	info := UpdateVersionInfo{
+		CurrentVersion: currentVersion,
+		LatestVersion:  latestVersion,
+		HasUpdate:      currentVersion != latestVersion,
+		ReleaseURL:     release.HTMLURL,
+		ReleaseName:    release.Name,
+		ReleaseBody:    release.Body,
+	}
+
+	if assetErr == nil && asset != nil {
+		info.AssetName = asset.Name
+		info.AssetSize = asset.Size
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"msg":  "ok",
+		"data": info,
+	})
+}
+
+var PROXIES = []string{
+	"", // 直连
+	"https://v6.gh-proxy.org/",
+	"https://gh-proxy.org/",
+	"https://hk.gh-proxy.org/",
+	"https://cdn.gh-proxy.org/",
+	"https://edgeone.gh-proxy.org/",
+	"https://fastgit.cc/",
+	"https://git.yylx.win/",
+	"https://ghfast.top/",
+}
+
+// DownloadProgress 下载进度
+type DownloadProgress struct {
+	Downloaded int64   `json:"downloaded"`
+	Total      int64   `json:"total"`
+	Percent    int     `json:"percent"`
+	Speed      float64 `json:"speed"`  // bytes per second
+	Status     string  `json:"status"` // idle | downloading | success | failed | restarting | cancelled
+	Message    string  `json:"message"`
+	Proxy      string  `json:"proxy"`
+	FileName   string  `json:"file_name"`
+	SHA256     string  `json:"sha256"`
+}
+
+var currentDownloadProgress = DownloadProgress{Status: "idle"}
+var downloadCancel context.CancelFunc
+
+// ProgressWriter 边写边更新全局进度
+type ProgressWriter struct {
+	Total      int64
+	Downloaded int64
+	StartTime  time.Time
+	LastTime   time.Time
+	LastBytes  int64
+}
+
+func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	pw.Downloaded += int64(n)
+	currentDownloadProgress.Downloaded = pw.Downloaded
+	if pw.Total > 0 {
+		currentDownloadProgress.Total = pw.Total
+		currentDownloadProgress.Percent = int(float64(pw.Downloaded) / float64(pw.Total) * 100)
+	}
+
+	// 计算实时速度（每秒更新）
+	now := time.Time{}
+	elapsed := now.Sub(pw.LastTime).Seconds()
+	if elapsed >= 0.5 {
+		bytesDiff := pw.Downloaded - pw.LastBytes
+		currentDownloadProgress.Speed = float64(bytesDiff) / elapsed
+		pw.LastTime = now
+		pw.LastBytes = pw.Downloaded
+	}
+
+	return n, nil
+}
+
+// downloadFileWithProxy 使用指定代理下载，空字符串为直连
+func downloadFileWithProxy(url string, savePath string, proxy string) error {
+	targetURL := url
+	if proxy != "" {
+		trimmed := strings.TrimPrefix(url, "https://")
+		p := proxy
+		if !strings.HasSuffix(p, "/") {
+			p += "/"
+		}
+		targetURL = p + trimmed
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	downloadCancel = cancel
+	defer cancel()
+
+	client := &http.Client{Timeout: 1 * time.Minute}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		currentDownloadProgress.Status = "failed"
+		currentDownloadProgress.Message = "构建请求失败: " + err.Error()
+		return err
+	}
+	req.Header.Set("User-Agent", "WebSSH-G5pro-Updater")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			currentDownloadProgress.Status = "cancelled"
+			currentDownloadProgress.Message = "下载已取消"
+			return fmt.Errorf("下载已取消")
+		}
+		currentDownloadProgress.Status = "failed"
+		currentDownloadProgress.Message = "请求失败: " + err.Error()
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		currentDownloadProgress.Status = "failed"
+		currentDownloadProgress.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	// 提取文件名
+	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if name, ok := params["filename"]; ok {
+				currentDownloadProgress.FileName = name
+			}
+		}
+	}
+	if currentDownloadProgress.FileName == "" {
+		parts := strings.Split(targetURL, "/")
+		if len(parts) > 0 {
+			currentDownloadProgress.FileName = parts[len(parts)-1]
+		}
+	}
+
+	out, err := os.OpenFile(savePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		currentDownloadProgress.Status = "failed"
+		currentDownloadProgress.Message = "创建文件失败: " + err.Error()
+		return err
+	}
+	defer out.Close()
+
+	pw := &ProgressWriter{
+		Total:     resp.ContentLength,
+		StartTime: time.Now(),
+		LastTime:  time.Now(),
+	}
+	currentDownloadProgress.Total = resp.ContentLength
+	if _, err := io.Copy(io.MultiWriter(out, pw), resp.Body); err != nil {
+		if ctx.Err() == context.Canceled {
+			currentDownloadProgress.Status = "cancelled"
+			currentDownloadProgress.Message = "下载已取消"
+			os.Remove(savePath)
+			return fmt.Errorf("下载已取消")
+		}
+		currentDownloadProgress.Status = "failed"
+		currentDownloadProgress.Message = "下载失败: " + err.Error()
+		return err
+	}
+
+	info, err := os.Stat(savePath)
+	if err != nil || info.Size() <= 0 {
+		currentDownloadProgress.Status = "failed"
+		currentDownloadProgress.Message = "下载文件为空"
+		return fmt.Errorf("下载文件为空")
+	}
+
+	currentDownloadProgress.Status = "success"
+	currentDownloadProgress.Percent = 100
+	currentDownloadProgress.Message = "下载完成"
+	return nil
+}
+
+// UpdateCancelHandler 取消下载
+func UpdateCancelHandler(c *gin.Context) {
+	if downloadCancel != nil && currentDownloadProgress.Status == "downloading" {
+		downloadCancel()
+		c.JSON(http.StatusOK, gin.H{"code": 0, "msg": "已发送取消请求"})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "当前没有正在进行的下载"})
+	}
+}
+
+// UpdateProxiesHandler 获取代理列表
+func UpdateProxiesHandler(c *gin.Context) {
+	type ProxyInfo struct {
+		URL  string `json:"url"`
+		Name string `json:"name"`
+	}
+
+	proxies := make([]ProxyInfo, 0, len(PROXIES))
+	for _, p := range PROXIES {
+		name := p
+		if p == "" {
+			name = "直连"
+		}
+		proxies = append(proxies, ProxyInfo{URL: p, Name: name})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"msg":  "ok",
+		"data": proxies,
+	})
+}
+
+// UpdateProgressHandler 获取下载进度
+func UpdateProgressHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"msg":  "ok",
+		"data": currentDownloadProgress,
+	})
+}
+
+// UpdateDownloadHandler 使用指定代理下载并触发更新
+func UpdateDownloadHandler(c *gin.Context) {
+	var req struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "参数错误: " + err.Error()})
+		return
+	}
+
+	if currentDownloadProgress.Status == "downloading" {
+		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "正在下载，请稍候"})
+		return
+	}
+
+	currentDownloadProgress = DownloadProgress{
+		Status:  "downloading",
+		Message: "准备下载...",
+		Proxy:   req.Proxy,
+	}
+
+	go func() {
+		release, err := getLatestGithubRelease()
+		if err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "获取版本信息失败: " + err.Error()
+			return
+		}
+
+		currentVersion := strings.TrimSpace(version)
+		latestVersion := strings.TrimSpace(release.TagName)
+		if currentVersion == latestVersion {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "当前已是最新版本"
+			return
+		}
+
+		asset, err := selectUpdateAsset(release)
+		if err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = err.Error()
+			return
+		}
+
+		currentBin, err := os.Executable()
+		if err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "获取当前二进制路径失败: " + err.Error()
+			return
+		}
+		currentBin, err = filepath.EvalSymlinks(currentBin)
+		if err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "解析当前二进制真实路径失败: " + err.Error()
+			return
+		}
+
+		tmpNewBin := filepath.Join(os.TempDir(), fmt.Sprintf("webssh_%s_%s.new", runtime.GOARCH, latestVersion))
+		logFile := filepath.Join(os.TempDir(), "webssh_update.log")
+
+		if err := downloadFileWithProxy(asset.BrowserDownloadURL, tmpNewBin, req.Proxy); err != nil {
+			return
+		}
+
+		currentDownloadProgress.Message = "正在校验文件..."
+		if err := verifyFileSHA256(tmpNewBin, req.Proxy); err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = err.Error()
+			os.Remove(tmpNewBin)
+			return
+		}
+
+		// 计算并显示SHA256
+		sha256Value, _ := computeFileSHA256(tmpNewBin)
+		currentDownloadProgress.SHA256 = sha256Value
+
+		if err := os.Chmod(tmpNewBin, 0755); err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "设置新二进制权限失败: " + err.Error()
+			return
+		}
+
+		scriptPath, err := createTempUpdateScript(currentBin, tmpNewBin, logFile, os.Args)
+		if err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "创建临时更新脚本失败: " + err.Error()
+			return
+		}
+
+		cmd := exec.Command("/bin/sh", scriptPath)
+		if err := cmd.Start(); err != nil {
+			currentDownloadProgress.Status = "failed"
+			currentDownloadProgress.Message = "启动临时更新脚本失败: " + err.Error()
+			return
+		}
+
+		currentDownloadProgress.Status = "restarting"
+		currentDownloadProgress.Message = "程序即将重启"
+	}()
+
+	c.JSON(http.StatusOK, gin.H{"code": 0, "msg": "已开始下载更新"})
+}
+
+// UpdateTestSpeedHandler 并发测试代理下载速度，整体 3 秒兜底
+func UpdateTestSpeedHandler(c *gin.Context) {
+	var req struct {
+		URL     string   `json:"url"`     // 要测试的文件 URL
+		Proxies []string `json:"proxies"` // 可选，仅测指定代理；为空则测全部内置代理
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "参数错误: " + err.Error()})
+		return
+	}
+	if req.URL == "" {
+		c.JSON(http.StatusOK, gin.H{"code": 1, "msg": "URL 不能为空"})
+		return
+	}
+
+	type SpeedTestResult struct {
+		Proxy    string  `json:"proxy"`
+		Name     string  `json:"name"`
+		Speed    float64 `json:"speed"`    // KB/s
+		Duration int64   `json:"duration"` // ms
+		Success  bool    `json:"success"`
+		Error    string  `json:"error"`
+	}
+
+	proxiesToTest := PROXIES
+	if len(req.Proxies) > 0 {
+		proxiesToTest = req.Proxies
+	}
+	results := make([]SpeedTestResult, len(proxiesToTest))
+	testSize := int64(1024 * 10) // 10KB
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for idx, proxy := range proxiesToTest {
+		wg.Add(1)
+		go func(i int, proxy string) {
+			defer wg.Done()
+			result := SpeedTestResult{Proxy: proxy, Name: proxy}
+			if proxy == "" {
+				result.Name = "直连"
+			}
+
+			testURL := req.URL
+			if proxy != "" {
+				trimmed := strings.TrimPrefix(req.URL, "https://")
+				p := proxy
+				if !strings.HasSuffix(p, "/") {
+					p += "/"
+				}
+				testURL = p + trimmed
+			}
+
+			startTime := time.Now()
+			client := &http.Client{Timeout: 2500 * time.Millisecond}
+
+			reqHTTP, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
+			if err != nil {
+				result.Error = err.Error()
+				results[i] = result
+				return
+			}
+			reqHTTP.Header.Set("Range", fmt.Sprintf("bytes=0-%d", testSize-1))
+			reqHTTP.Header.Set("User-Agent", "WebSSH-u60pro-Updater")
+
+			resp, err := client.Do(reqHTTP)
+			if err != nil {
+				result.Error = err.Error()
+				results[i] = result
+				return
+			}
+			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+				resp.Body.Close()
+				result.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+				results[i] = result
+				return
+			}
+
+			downloaded, err := io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			duration := time.Since(startTime)
+
+			if err != nil {
+				result.Error = err.Error()
+				results[i] = result
+				return
+			}
+			if duration.Seconds() > 0 {
+				result.Speed = float64(downloaded) / 1024 / duration.Seconds()
+			}
+			result.Duration = duration.Milliseconds()
+			result.Success = true
+			results[i] = result
+		}(idx, proxy)
+	}
+	wg.Wait()
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"msg":  "ok",
+		"data": results,
+	})
+}
+
+// downloadFile 支持直连和代理，每次请求单独超时
+func downloadFile(url string, savePath string) error {
+	// 先构建尝试 URL 列表
+	tryURLs := append([]string{url}, func() []string {
+		var proxied []string
+		for _, p := range PROXIES {
+			if p == "" {
+				continue // 直连已在首位
+			}
+			trimmed := strings.TrimPrefix(url, "https://")
+			if !strings.HasSuffix(p, "/") {
+				p += "/"
+			}
+			proxied = append(proxied, p+trimmed)
+		}
+		return proxied
+	}()...)
+
+	var lastErr error
+	for _, u := range tryURLs {
+		client := &http.Client{Timeout: 15 * time.Second} // 每次单独 15 秒
+
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		req.Header.Set("User-Agent", "WebSSH-G5pro-Updater")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			resp.Body.Close()
+			continue
+		}
+
+		out, err := os.OpenFile(savePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			resp.Body.Close()
+			return err
+		}
+
+		_, err = io.Copy(out, resp.Body)
+		resp.Body.Close()
+		out.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		info, err := os.Stat(savePath)
+		if err != nil || info.Size() <= 0 {
+			lastErr = fmt.Errorf("下载文件为空")
+			continue
+		}
+
+		// 成功下载
+		return nil
+	}
+
+	return fmt.Errorf("下载失败，尝试直连和代理都失败: %v", lastErr)
+}
+
+func createTempUpdateScript(currentBin string, newBin string, logFile string, args []string) (string, error) {
+	pid := os.Getpid()
+
+	workDir, err := os.Getwd()
+	if err != nil {
+		workDir = filepath.Dir(currentBin)
+	}
+
+	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("webssh_update_%d.sh", time.Now().UnixNano()))
+
+	quotedArgs := ""
+	for _, arg := range args[1:] {
+		quotedArgs += " " + shellQuote(arg)
+	}
+
+	content := fmt.Sprintf(`#!/bin/sh
+
+LOG_FILE=%s
+OLD_PID=%d
+CURRENT_BIN=%s
+NEW_BIN=%s
+WORK_DIR=%s
+ARGS=%s
+
+echo "==============================" >> "$LOG_FILE"
+echo "WebSSH 更新开始: $(date)" >> "$LOG_FILE"
+echo "旧进程 PID: $OLD_PID" >> "$LOG_FILE"
+echo "当前二进制: $CURRENT_BIN" >> "$LOG_FILE"
+echo "新二进制: $NEW_BIN" >> "$LOG_FILE"
+
+sleep 1
+
+echo "停止旧进程..." >> "$LOG_FILE"
+kill "$OLD_PID" >> "$LOG_FILE" 2>&1 || true
+
+sleep 1
+
+if kill -0 "$OLD_PID" 2>/dev/null; then
+  echo "旧进程仍存在，强制结束..." >> "$LOG_FILE"
+  kill -9 "$OLD_PID" >> "$LOG_FILE" 2>&1 || true
+fi
+
+if [ ! -s "$NEW_BIN" ]; then
+  echo "新二进制不存在或为空，更新终止" >> "$LOG_FILE"
+  rm -f "$0"
+  exit 1
+fi
+
+chmod +x "$NEW_BIN"
+
+echo "备份旧二进制..." >> "$LOG_FILE"
+if [ -f "$CURRENT_BIN" ]; then
+  cp "$CURRENT_BIN" "$CURRENT_BIN.bak" >> "$LOG_FILE" 2>&1 || true
+fi
+
+echo "替换二进制..." >> "$LOG_FILE"
+mv "$NEW_BIN" "$CURRENT_BIN" >> "$LOG_FILE" 2>&1
+
+chmod +x "$CURRENT_BIN"
+
+echo "启动新进程..." >> "$LOG_FILE"
+cd "$WORK_DIR" || cd /
+nohup "$CURRENT_BIN" $ARGS >> /tmp/webssh_run.log 2>&1 &
+
+echo "新进程已启动: $(date)" >> "$LOG_FILE"
+echo "清理临时脚本" >> "$LOG_FILE"
+
+rm -f "$0"
+`, shellQuote(logFile), pid, shellQuote(currentBin), shellQuote(newBin), shellQuote(workDir), strconv.Quote(quotedArgs))
+
+	if err := os.WriteFile(scriptPath, []byte(content), 0755); err != nil {
+		return "", err
+	}
+
+	return scriptPath, nil
+}
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+func UpdateRunHandler(c *gin.Context) {
+	release, err := getLatestGithubRelease()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "获取 GitHub 最新版本失败: " + err.Error(),
+		})
+		return
+	}
+
+	currentVersion := strings.TrimSpace(version)
+	latestVersion := strings.TrimSpace(release.TagName)
+
+	if currentVersion == latestVersion {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 0,
+			"msg":  "当前已经是最新版本",
+			"data": gin.H{
+				"current_version": currentVersion,
+				"latest_version":  latestVersion,
+			},
+		})
+		return
+	}
+
+	asset, err := selectUpdateAsset(release)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  err.Error(),
+		})
+		return
+	}
+
+	currentBin, err := os.Executable()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "获取当前二进制路径失败: " + err.Error(),
+		})
+		return
+	}
+
+	currentBin, err = filepath.EvalSymlinks(currentBin)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "解析当前二进制真实路径失败: " + err.Error(),
+		})
+		return
+	}
+
+	tmpNewBin := filepath.Join(os.TempDir(), fmt.Sprintf("webssh_%s_%s.new", runtime.GOARCH, latestVersion))
+	logFile := filepath.Join(os.TempDir(), "webssh_update.log")
+
+	if err := downloadFile(asset.BrowserDownloadURL, tmpNewBin); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "下载新版本失败: " + err.Error(),
+		})
+		return
+	}
+
+	if err := verifyFileSHA256(tmpNewBin, ""); err != nil {
+		os.Remove(tmpNewBin)
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  err.Error(),
+		})
+		return
+	}
+
+	if err := os.Chmod(tmpNewBin, 0755); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "设置新二进制权限失败: " + err.Error(),
+		})
+		return
+	}
+
+	scriptPath, err := createTempUpdateScript(currentBin, tmpNewBin, logFile, os.Args)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "创建临时更新脚本失败: " + err.Error(),
+		})
+		return
+	}
+
+	cmd := exec.Command("/bin/sh", scriptPath)
+
+	if err := cmd.Start(); err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"code": 1,
+			"msg":  "启动临时更新脚本失败: " + err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code": 0,
+		"msg":  "已开始更新，程序即将重启",
+		"data": gin.H{
+			"current_version": currentVersion,
+			"latest_version":  latestVersion,
+			"asset_name":      asset.Name,
+			"asset_size":      asset.Size,
+			"log_file":        logFile,
+			"script":          scriptPath,
+		},
+	})
+}
+
+func OpenAdbHandler(c *gin.Context) {
+	slog.Info("[API] /api/openadb 调用开始")
+
+	// G5 Pro: 通过 ZTE 私有 ubus 接口 zwrt_bsp.usb set 开启 ADB 调试
+	// 与官方 openadb.php 完全一致: ubus call zwrt_bsp.usb set '{"mode":"debug"}'
+	// 说明: 该 ubus set 方法仅接受 "debug" 来开启 ADB("normal" 会被拒绝, exit 255),
+	//       故此处固定开启 ADB——幂等, 重复开启无害。前端也仅提供"开启"入口。
+	// WebSSH 以 root 运行, 本地 ubus 调用无需登录会话(与 GetDataFromUbus 透明代理一致)。
+	cmd := exec.Command("ubus", "call", "zwrt_bsp.usb", "set", `{"mode":"debug"}`)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Error("[API] openadb 执行失败", "err", err.Error(), "output", string(output))
+		c.JSON(http.StatusOK, gin.H{
+			"code":    1,
+			"success": false,
+			"msg":     fmt.Sprintf("ADB 开启失败: %s | %s", err.Error(), strings.TrimSpace(string(output))),
+			"output":  string(output),
+		})
+		return
+	}
+
+	slog.Info("[API] openadb 执行成功(ADB 已开启)", "output", string(output))
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"success": true,
+		"msg":     "ADB 已开启",
+		"enabled": true,
+		"mode":    "debug",
+		"output":  string(output),
+	})
+}
+
+// AdbStatusHandler 检测当前 ADB 调试端口是否开启
+// 判定依据(任一满足即视为开启):
+//   1) USB gadget 配置串包含 "adb"(debug 模式为 rndis_adb_dualacm, user 模式为 rndis)
+//      —— 这是 ADB 是否真正对外的权威信号(进程 adbd_usb 与模式无关, 始终在跑)
+//   2) 兜底: UCI usb.mode.mode == debug
+func AdbStatusHandler(c *gin.Context) {
+	enabled := false
+	reason := ""
+
+	// 1) USB gadget 配置串是否包含 adb(权威信号)
+	if out, err := exec.Command("sh", "-c",
+		"cat /config/usb_gadget/g1/configs/b.1/strings/0x409/configuration 2>/dev/null").CombinedOutput(); err == nil {
+		if strings.Contains(string(out), "adb") {
+			enabled = true
+			reason = "gadget_adb"
+		}
+	}
+
+	// 2) 兜底: UCI usb.mode.mode == debug
+	if !enabled {
+		if out, err := exec.Command("sh", "-c", "uci get usb.mode.mode 2>/dev/null").CombinedOutput(); err == nil {
+			if strings.TrimSpace(string(out)) == "debug" {
+				enabled = true
+				reason = "uci_debug"
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"enabled": enabled,
+		"reason":  reason,
+		"msg":     map[bool]string{true: "ADB 调试已开启", false: "ADB 调试未开启"}[enabled],
+	})
+}
+
+// AdbCloseHandler 关闭 ADB 调试端口
+// 机制(2026-08 设备实测确认):
+//   - 开启 ADB: `ubus call zwrt_bsp.usb set '{"mode":"debug"}'` 会按 debug 模式重配 USB gadget,
+//     在 configs/b.1 下挂接 ffs.adb 函数(配置串 rndis_adb_dualacm), ADB 对外可见。
+//   - 该 ubus 仅接受 debug(其他模式被拒或无效), 因此不能用 ubus 直接关闭。
+//   - 正确关闭: 将 UCI usb.mode.mode 设为 user(注意: 不能用 normal —— init 脚本 case 不含 normal,
+//     会导致 USB 异常), 再重启 usb.init 服务, 使其按 user 模式重配 gadget(仅 rndis、不挂 ffs.adb),
+//     ADB 即不可见。adbd_usb 守护进程与模式无关、始终在跑, 故不以进程是否存在判断开关。
+//   - 判定开关的权威信号见 AdbStatusHandler(USB gadget 配置串 / UCI mode)。
+func AdbCloseHandler(c *gin.Context) {
+	slog.Info("[API] /api/adb/close 调用开始")
+
+	// 1) 复位 UCI 模式为 user(非 normal: 避免 init 脚本 case 不匹配导致 USB 异常)
+	_, setErr := exec.Command("sh", "-c", "uci set usb.mode.mode=user; uci commit usb 2>/dev/null; true").CombinedOutput()
+
+	// 2) 重启 usb.init 服务, 按 user 模式重配 USB gadget(移除 adb 函数)
+	_, restartErr := exec.Command("sh", "-c", "/etc/init.d/usb.init restart >/dev/null 2>&1; true").CombinedOutput()
+
+	if setErr != nil {
+		slog.Warn("[API] adb close uci 警告", "err", setErr.Error())
+	}
+	if restartErr != nil {
+		slog.Warn("[API] adb close restart 警告", "err", restartErr.Error())
+	}
+
+	slog.Info("[API] adb close 执行完成")
+	c.JSON(http.StatusOK, gin.H{
+		"code":    0,
+		"success": true,
+		"enabled": false,
+		"msg":     "ADB 调试已关闭",
+	})
+}
+
+
+// ThermalHandler 读取关键 thermal_zone 温度(G5 Pro 设备无电池, 替代原 battery 字段)
+// 直接读 Linux 标准 sysfs thermal 接口(无 ubus 中转):
+//   zone0=soc_max(SoC 峰值), zone1~4=cpu_little0~3, zone9=md0(Modem), zone22=mboard_ntc(主板)
+// 单位摄氏度, 读不到返回 0
+func ThermalHandler(c *gin.Context) {
+	readZone := func(zone int) int {
+		path := fmt.Sprintf("/sys/class/thermal/thermal_zone%d/temp", zone)
+		out, err := os.ReadFile(path)
+		if err != nil {
+			return 0
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(string(out)))
+		if err != nil {
+			return 0
+		}
+		return v / 1000 // mC -> °C
+	}
+
+	// 小核 cluster 平均(zone 1~4)
+	cpuAvg := 0
+	for i := 1; i <= 4; i++ {
+		cpuAvg += readZone(i)
+	}
+	cpuAvg /= 4
+
+	c.JSON(http.StatusOK, gin.H{
+		"code":       0,
+		"cpu_temp":   cpuAvg,    // CPU 小核平均(°C)
+		"soc_max":    readZone(0),  // SoC 峰值
+		"modem_temp": readZone(9),  // Modem(md0) 温度
+		"board_temp": readZone(22), // 主板 NTC 温度
+	})
+}
+
+func initApplication() {
+	config.InitConfig()
+	model.InitDatabase()
+	service.InitSessionClean()
+	service.InitSshServer()
+	fmt.Printf("WebBaseDir:[%s]\n", config.DefaultConfig.WebBaseDir)
+}
+
+func main() {
+	service.MaybeExecShellHelper()
+	initApplication()
+
+	gin.SetMode(gin.ReleaseMode)
+	var engine = gin.Default()
+	engine.MaxMultipartMemory = 8 << 20
+	engine.Use(middleware.DbCheck(), middleware.NetFilter())
+	engine.GET("/web_base_dir", func(c *gin.Context) { c.JSON(200, gin.H{"code": 0, "web_base_dir": config.DefaultConfig.WebBaseDir}) })
+
+	engine.NoRoute(func(c *gin.Context) {
+		c.Redirect(http.StatusMovedPermanently, config.DefaultConfig.WebBaseDir+"/app")
+	})
+
+	// 不需要认证的路由
+	var open = engine.Group(config.DefaultConfig.WebBaseDir)
+	open.StaticFS("/app", http.FS(StaticFile{embedFS: dir, path: "webroot"}))
+	open.POST("/api/login", service.UserLogin)
+	open.POST("/api/sys/db_conn_check", service.DbConnCheck)
+	open.GET("/api/sys/is_init", service.GetIsInit)
+	open.POST("/api/sys/init", service.SysInit)
+
+	// 需要认证的路由
+	var auth = engine.Group(config.DefaultConfig.WebBaseDir,
+		middleware.SysInit(),
+		middleware.JWTAuth(),
+		middleware.PremCheck(engine),
+	)
+
+	{
+		// UBUS 调用接口
+		// auth.POST("/api/ubus", service.UbusAction)
+		auth.POST("/api/ubus", service.ZteUbusBatchHandler)
+		// WiFi高性能模型 查询和修改
+		auth.POST("/api/wifi/psm/get", service.WifiPsmGetHandler)
+		auth.POST("/api/wifi/psm/set", service.WifiPsmSetHandler)
+		auth.POST("/api/wifi/state/set", service.WifiStateSetHandler)
+		auth.POST("/api/net/ambr/get", service.NetAmbrGetHandler)
+		// 整机防火墙开关 + 整机重启（已下线实现：路由一并清理占位，避免 unbound 引用）
+		// 如需重新启用，请按 ubus router_set_firewall_switch/reboot 自行补 handler。
+		// auth.GET("/api/sys/firewall/status", service.FirewallStatusHandler)
+		// auth.POST("/api/sys/firewall/set", service.FirewallSetHandler)
+		// auth.POST("/api/sys/restart", service.SystemRestartHandler)
+		// 内核 conntrack 连接表状态 + 占用最高设备名
+		auth.GET("/api/sys/conntrack", service.ConntrackHandler)
+	}
+
+	{ // SSH 连接配置
+		auth.GET("/api/conn_conf", service.ConfFindAll)
+		auth.GET("/api/conn_conf/:id", service.ConfFindByID)
+		auth.POST("/api/conn_conf", service.ConfCreate)
+		auth.PUT("/api/conn_conf", service.ConfUpdateById)
+		auth.DELETE("/api/conn_conf/:id", service.ConfDeleteById)
+	}
+
+	{ // 命令收藏
+		auth.GET("/api/cmd_note", service.CmdNoteFindAll)
+		auth.GET("/api/cmd_note/:id", service.CmdNoteFindByID)
+		auth.POST("/api/cmd_note", service.CmdNoteCreate)
+		auth.PUT("/api/cmd_note", service.CmdNoteUpdateById)
+		auth.DELETE("/api/cmd_note/:id", service.CmdNoteDeleteById)
+	}
+
+	{ // 策略配置
+		auth.GET("/api/policy_conf", service.PolicyConfFindAll)
+		auth.GET("/api/policy_conf/:id", service.PolicyConfFindByID)
+		auth.POST("/api/policy_conf", service.PolicyConfCreate)
+		auth.PUT("/api/policy_conf", service.PolicyConfUpdateById)
+		auth.DELETE("/api/policy_conf/:id", service.PolicyConfDeleteById)
+	}
+
+	{ // 访问控制
+		auth.GET("/api/net_filter", service.NetFilterFindAll)
+		auth.GET("/api/net_filter/:id", service.NetFilterFindByID)
+		auth.POST("/api/net_filter", service.NetFilterCreate)
+		auth.PUT("/api/net_filter", service.NetFilterUpdateById)
+		auth.DELETE("/api/net_filter/:id", service.NetFilterDeleteById)
+	}
+
+	{ // Web用户管理
+		auth.GET("/api/user", service.UserFindAll)
+		auth.GET("/api/user/:id", service.UserFindByID)
+		auth.POST("/api/user", service.UserCreate)
+		auth.PUT("/api/user", service.UserUpdateById)
+		auth.DELETE("/api/user/:id", service.UserDeleteById)
+		auth.PATCH("/api/user/check_name_exists", service.CheckUserNameExists)
+		auth.PATCH("/api/user/pwd", service.ModifyPasswd)
+	}
+
+	{ // SSHD用户管理
+		auth.GET("/api/sshd_user", service.SshdUserFindAll)
+		auth.GET("/api/sshd_user/:id", service.SshdUserFindByID)
+		auth.POST("/api/sshd_user", service.SshdUserCreate)
+		auth.PUT("/api/sshd_user", service.SshdUserUpdateById)
+		auth.DELETE("/api/sshd_user/:id", service.SshdUserDeleteById)
+		auth.PATCH("/api/sshd_user/check_name_exists", service.CheckSshdUserNameExists)
+	}
+
+	{ // SSHD证书管理
+		auth.GET("/api/sshd_cert", service.SshdCertFindAll)
+		auth.GET("/api/sshd_cert_text", service.GetSshdCertAuthorizedKeys)
+		auth.GET("/api/sshd_cert/:id", service.SshdCertFindByID)
+		auth.POST("/api/sshd_cert", service.SshdCertCreate)
+		auth.PUT("/api/sshd_cert", service.SshdCertUpdateById)
+		auth.DELETE("/api/sshd_cert/:id", service.SshdCertDeleteById)
+		auth.PATCH("/api/sshd_cert/check_name_exists", service.CheckSshdCertNameExists)
+	}
+
+	{ // 审计日志
+		auth.POST("/api/login_audit", service.LoginAuditSearch)
+	}
+
+	{ // SSH链接
+		auth.GET("/api/conn_manage/online_client", service.GetOnlineClient)
+		auth.PUT("/api/conn_manage/refresh_conn_time", service.RefreshConnTime)
+		auth.POST("/api/sftp/create_dir", service.SftpCreateDir)
+		auth.POST("/api/sftp/list", service.SftpList)
+		auth.GET("/api/sftp/download", service.SftpDownLoad)
+		auth.PUT("/api/sftp/upload", service.SftpUpload)
+		auth.DELETE("/api/sftp/delete", service.SftpDelete)
+		auth.GET("/api/ssh/conn", service.NewSshConn)
+		auth.PATCH("/api/ssh/conn", service.ResizeWindow)
+		auth.POST("/api/ssh/exec", service.ExecCommand)
+		auth.POST("/api/ssh/disconnect", service.Disconnect)
+		auth.POST("/api/ssh/create_session", service.CreateSessionId)
+	}
+
+	{ // 系统配置
+		auth.GET("/api/sys/config", service.GetRunConf)
+		auth.POST("/api/sys/config", service.SetRunConf)
+	}
+
+	{ // 主题多端同步
+		auth.GET("/api/theme", service.GetTheme)
+		auth.POST("/api/theme", service.SetTheme)
+	}
+
+	{ // 系统更新
+		auth.GET("/api/update/version", UpdateVersionHandler)
+		auth.POST("/api/update/run", UpdateRunHandler)
+		auth.GET("/api/update/proxies", UpdateProxiesHandler)
+		auth.GET("/api/update/progress", UpdateProgressHandler)
+		auth.POST("/api/update/download", UpdateDownloadHandler)
+		auth.POST("/api/update/cancel", UpdateCancelHandler)
+		auth.POST("/api/update/test-speed", UpdateTestSpeedHandler)
+	}
+	{
+		// 开启 / 关闭 ADB 调试端口 + 状态检测
+		auth.POST("/api/openadb", OpenAdbHandler)
+		auth.GET("/api/adb/status", AdbStatusHandler)
+		auth.POST("/api/adb/close", AdbCloseHandler)
+	}
+
+	{ // 系统温度(G5 Pro 无电池, 从 sysfs thermal_zone 读取 SoC/CPU/Modem/Board)
+		auth.GET("/api/sys/thermal", ThermalHandler)
+	}
+
+	{ // zz-conntrack 装机/卸载/状态（前端"连接状态·conntrack"卡内按钮）
+		auth.POST("/api/sys/conntrack/install", service.ConntrackInstallHandler)
+		auth.POST("/api/sys/conntrack/uninstall", service.ConntrackUninstallHandler)
+		auth.GET("/api/sys/conntrack/status", service.ConntrackStatusHandler)
+	}
+
+	{ // RF 频段功率切换（mipc_wan_cli --at_cmd AT+EFMAXPWR=...）
+		// 前端"网络信息卡片 SIM/网络 上方"两按钮：设置 29dBm / 恢复默认
+		auth.POST("/api/sys/rf-maxpower/set", service.RfMaxpowerHandler)
+		auth.POST("/api/sys/rf-maxpower/default", service.RfMaxpowerDefaultHandler)
+		auth.GET("/api/sys/rf-maxpower/status", service.RfMaxpowerStatusHandler)
+	}
+
+	address := fmt.Sprintf("%s:%s", config.DefaultConfig.Address, config.DefaultConfig.Port)
+	_, certErr := os.Open(config.DefaultConfig.CertFile)
+	_, keyErr := os.Open(config.DefaultConfig.KeyFile)
+
+	// 如果证书和私钥文件存在,就使用https协议,否则使用http协议
+	if certErr == nil && keyErr == nil {
+		slog.Info("https_server_start", "address", address)
+		err := engine.RunTLS(address, config.DefaultConfig.CertFile, config.DefaultConfig.KeyFile)
+		if err != nil {
+			slog.Error("RunServeTLSError:", "msg", err.Error())
+			os.Exit(1)
+			return
+		}
+	} else {
+		slog.Info("http_server_start", "address", address)
+		err := engine.Run(address)
+		if err != nil {
+			slog.Error("RunServeError:", "msg", err.Error())
+			os.Exit(1)
+			return
+		}
+	}
+}

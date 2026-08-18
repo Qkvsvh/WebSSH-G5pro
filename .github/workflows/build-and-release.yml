@@ -1,0 +1,105 @@
+name: Build & Release WebSSH
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+# 发布 Release 需要写权限（默认 GITHUB_TOKEN 只有 contents:read，会导致发布失败）
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 生成版本号（UTC+8）
+      - name: Generate version
+        id: version
+        run: |
+          VERSION=$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "当前版本: $VERSION"
+
+      # 3. Node 环境
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 4. 构建前端
+      - name: Build webssh
+        run: |
+          cd webssh
+          npm install
+          npm run buildOnly
+
+      # 5. 拷贝 dist → webroot
+      - name: Prepare webroot
+        run: |
+          rm -rf gossh/webroot/*
+          mkdir -p gossh/webroot
+          cp -r webssh/dist/* gossh/webroot/
+
+      # 6. Go 环境（必须 >= go.mod 中声明的 1.24.0）
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      # 7. 构建 Go（二进制 + 内嵌版本）
+      - name: Build Go binary
+        run: |
+          cd gossh
+
+          export CGO_ENABLED=0
+          export GOOS=linux
+          export GOARCH=arm64
+
+          go env -w GOPROXY=https://goproxy.cn,direct
+          go mod tidy
+
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o webssh_${VERSION}
+          cp webssh_${VERSION} webssh_arm64
+
+      # 8. UPX 压缩（可选；压缩两个产物，保证 version.json 的 sha256 与发布资产一致）
+      - name: Install UPX
+        run: sudo apt-get install -y upx-ucl
+
+      - name: Compress binary
+        run: |
+          cd gossh
+          upx --best --lzma webssh_${VERSION} || true
+          upx --best --lzma webssh_arm64 || true
+
+      # 9. 生成 version 文件（sha256 取自实际分发的 webssh_arm64）
+      - name: Generate version file
+        run: |
+          FILE_PATH="gossh/webssh_arm64"
+          SHA256=$(sha256sum ${FILE_PATH} | awk '{print $1}')
+          SIZE=$(stat -c%s ${FILE_PATH})
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION}/webssh_arm64"
+          echo "{\"version\":\"${VERSION}\",\"sha256\":\"${SHA256}\",\"size\":${SIZE},\"downloadUrl\":\"${DOWNLOAD_URL}\"}" > version.json
+          echo "${VERSION}" > version.txt
+      
+      # 10. 创建 Release（直接上传原始文件）
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            gossh/webssh_${{ steps.version.outputs.version }}
+            gossh/webssh_arm64
+            version.txt
+            version.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

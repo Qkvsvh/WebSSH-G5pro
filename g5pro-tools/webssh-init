@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# WebSSH procd init.d —— 替代 G5 Pro 上不可靠的 rc.local 自启
+#
+# 背景：G5 Pro 的 /etc/rc.local 默认开机不执行，导致 rc.local+service.sh 方案
+#       在冷启动后 webssh 不一定能起来（已踩坑）。procd init.d 脚本开机必跑
+#       （同目录 zz-conntrack 已验证），用它托管 webssh 最稳。
+#
+# 部署（在设备上有 shell 时执行）：
+#   scp webssh-init root@192.168.0.1:/etc/init.d/webssh
+#   chmod 755 /etc/init.d/webssh
+#   /etc/init.d/webssh enable        # 生成 /etc/rc.d/S90webssh
+#   /etc/init.d/webssh start         # 立即拉起（无需重启）
+#
+# 注意：启用本脚本后，应同时去掉 rc.local 里的
+#       `sh /data/webssh/service.sh start` 一行，避免重复拉起抢端口。
+#       （G5 Pro 上 rc.local 本就不执行，不去掉也只是冗余，不会冲突。）
+
+USE_PROCD=1
+START=90
+STOP=10
+
+start_service() {
+    procd_open_instance webssh
+    procd_set_param command /data/webssh/webssh -ConfigDir /data/webssh
+    procd_set_param respawn            # 进程异常退出自动拉起
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
