@@ -1117,11 +1117,10 @@ func main() {
 		auth.POST("/api/wifi/psm/set", service.WifiPsmSetHandler)
 		auth.POST("/api/wifi/state/set", service.WifiStateSetHandler)
 		auth.POST("/api/net/ambr/get", service.NetAmbrGetHandler)
-		// 整机防火墙开关 + 整机重启（已下线实现：路由一并清理占位，避免 unbound 引用）
-		// 如需重新启用，请按 ubus router_set_firewall_switch/reboot 自行补 handler。
-		// auth.GET("/api/sys/firewall/status", service.FirewallStatusHandler)
-		// auth.POST("/api/sys/firewall/set", service.FirewallSetHandler)
-		// auth.POST("/api/sys/restart", service.SystemRestartHandler)
+		// 整机防火墙开关（zwrt_router.api router_set/get_firewall_switch）
+		auth.GET("/api/sys/firewall/status", service.FirewallStatusHandler)
+		auth.POST("/api/sys/firewall/set", service.FirewallSetHandler)
+		// 整机重启（沿用原 note：SystemRestartHandler 尚未实现，暂不开放路由）
 		// 内核 conntrack 连接表状态 + 占用最高设备名
 		auth.GET("/api/sys/conntrack", service.ConntrackHandler)
 	}

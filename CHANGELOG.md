@@ -5,6 +5,17 @@
 
 ---
 
+## 〇、近期修复（2026-08-22）
+
+- **修复防火墙开关置灰**：原 `main.go` 中整机防火墙的两条路由
+  `GET /api/sys/firewall/status` 与 `POST /api/sys/firewall/set` 被整段注释
+  （标注"已下线实现"），导致前端永远拿不到 `firewallStatus`，两个防火墙按钮
+  恒为 `disabled`（灰色）。新增 `gossh/app/service/firewall.go` 实现两个 handler
+  （设置走 `ubus call zwrt_router.api router_set_firewall_switch '{"enable":0|1}'`，
+  查询走对应的 `router_get_firewall_switch`，并兼容 `enable`/`enabled` 键名与多种
+  取值形态），并在 `main.go` 恢复路由注册。另用内存缓存兜底：当设备上的 get 方法
+  不可用时，回退到最近一次成功 set 的状态，避免按钮再次置灰。
+
 ## 一、项目定位与适配目标
 
 - 后端 Go(gin) 单二进制，内嵌前端（`//go:embed webroot`），监听 Web `:8899` 与内嵌 SSH 服务端 `:3540`。
