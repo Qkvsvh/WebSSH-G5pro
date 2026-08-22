@@ -46,4 +46,4 @@ cd ..
 echo "==> 完成: gossh/$BIN"
 echo "    发布步骤：在 GitHub 创建 Release，上传 gossh/$BIN（保持文件名 $BIN）"
 echo "    用户在 G5 Pro 上执行："
-echo "      sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/qkvsvh/WebSSH-G5pro/main/g5pro-install.sh)\""
+echo "      sh -c \"\$(curl -fsSL https://raw.githubusercontent.com/Qkvsvh/WebSSH-G5pro/main/g5pro-install.sh)\""

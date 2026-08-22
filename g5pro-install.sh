@@ -19,8 +19,8 @@
 # ============================================================================
 
 # ====================== 可配置项 ======================
-# ↓↓↓ 改成你上传后的 GitHub 仓库（当前：qkvsvh/WebSSH-G5pro）↓↓↓
-REPO="${REPO:-qkvsvh/WebSSH-G5pro}"
+# ↓↓↓ 改成你上传后的 GitHub 仓库（当前：Qkvsvh/WebSSH-G5pro）↓↓↓
+REPO="${REPO:-Qkvsvh/WebSSH-G5pro}"
 # 安装目录（OpenWrt 需可写，/data 已持久化）
 Module_dir="/data/webssh"
 BIN="$Module_dir/webssh"

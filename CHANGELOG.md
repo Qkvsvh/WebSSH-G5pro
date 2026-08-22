@@ -15,6 +15,7 @@
   查询走对应的 `router_get_firewall_switch`，并兼容 `enable`/`enabled` 键名与多种
   取值形态），并在 `main.go` 恢复路由注册。另用内存缓存兜底：当设备上的 get 方法
   不可用时，回退到最近一次成功 set 的状态，避免按钮再次置灰。
+- **README 文档修正**：① 卸载说明与脚本行为矛盾——`g5pro-install.sh remove` 实际执行 `rm -rf /data/webssh`（连同配置 `.GoWebSSH` 一并删除），原文"保留配置目录"已改为如实描述；② 功能特性补全"整机防火墙一键开关"，并澄清安装时"放行防火墙"（仅新增一条放行 `8899` 端口的 UCI 规则）与面板内"关闭整个防火墙"是两回事；③ 仓库 owner 统一为规范名 `Qkvsvh`（GitHub 对 owner 大小写不敏感，原 `qkvsvh` 也可用），并同步修正 `g5pro-install.sh` 与 `build.sh` 中的同名引用。
 
 ## 一、项目定位与适配目标
 

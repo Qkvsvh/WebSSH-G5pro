@@ -24,6 +24,7 @@
 - 网页 SSH 终端（xterm.js）/ SFTP 文件管理
 - 实时设备仪表盘：5G/4G 信号、流量统计、AMBR/QCI、温度（CPU / 基带 / 主板）、SIM 卡号
 - OpenADB 一键开启 / 关闭
+- 整机防火墙一键开关（面板内开启 / 关闭**整个**防火墙，依赖 `ubus zwrt_router.api`）
 - 主机 / 连接 / 用户 / 命令收藏 / 审计 等管理功能
 - 单文件二进制 + procd init.d 开机自启（崩溃自愈），一条命令安装 / 升级 / 卸载
 
@@ -38,7 +39,7 @@
 在 G5 Pro 的 SSH 终端里执行下面一行：
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/qkvsvh/WebSSH-G5pro/main/g5pro-install.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/Qkvsvh/WebSSH-G5pro/main/g5pro-install.sh)"
 ```
 
 脚本会自动完成：
@@ -46,7 +47,7 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/qkvsvh/WebSSH-G5pro/main/g
 1. 下载最新 Release 的 `webssh_arm64`
 2. 安装到 `/data/webssh`
 3. 注册 procd 开机自启（`/etc/init.d/webssh` + `enable` → `/etc/rc.d/S90webssh`）
-4. 放行防火墙
+4. 放行防火墙（仅新增一条放行 `8899` 端口的 UCI 规则，不影响整机防火墙；面板内另有"关闭整个防火墙"开关）
 5. 启动服务
 
 ### 2. 打开管理面板
@@ -65,7 +66,7 @@ sh g5pro-install.sh update
 
 ```sh
 sh g5pro-install.sh start|stop|restart
-sh g5pro-install.sh remove      # 卸载（保留配置目录 /data/webssh/.GoWebSSH）
+sh g5pro-install.sh remove      # 卸载（停止服务 + 删除 /data/webssh 整个目录，含配置 + 去除防火墙规则）
 ```
 
 ---
@@ -114,11 +115,11 @@ cd ..
 
 ### 发布前注意
 
-安装脚本 `g5pro-install.sh` 顶部的 `REPO` 变量已设为本仓库 `qkvsvh/WebSSH-G5pro`。
+安装脚本 `g5pro-install.sh` 顶部的 `REPO` 变量已设为本仓库 `Qkvsvh/WebSSH-G5pro`。
 如果你 fork 到自己的账号，把它改成你的 `用户名/仓库名` 即可：
 
 ```sh
-REPO="${REPO:-qkvsvh/WebSSH-G5pro}"
+REPO="${REPO:-Qkvsvh/WebSSH-G5pro}"
 ```
 
 ---
